@@ -1,0 +1,554 @@
+---
+title: "Time Series Forecasting"
+author: "Jennifer Brosnahan"
+date: "9/12/2020"
+output:
+  html_document: 
+    keep_md: yes
+    theme: lumen
+    highlight: haddock
+---
+
+
+## Objective
+#### We have been asked to forecast power consumption by submeter for a client's residential home. The objective is to visualize and forecast energy use by performing time series linear regression and Holt Winters modeling on each submeter. Forecasted results will help client determine energy use patterns and energy saving recommendations will be offered based on results.
+
+## Data Description
+#### Data consists of energy consumed per minute for 3 different sub-meters in residential home in Seaux, France between December 2006 and November 2010 (47 months). It contains over 2 million minute observations of electric power consumption. 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(openxlsx)
+
+Data_Table <- read.xlsx(file.path('C:/Users/jlbro/OneDrive/Energy Visualizations', 'Data Table.xlsx'))
+
+kable(Data_Table) %>% 
+  kable_styling(bootstrap_options = c('striped','hover'), full_width = FALSE)
+```
+#### Source: UCI Machine Learning Repository 'Individual household electric power consumption' data set
+
+#### Submeter description:
+
+  + Submeter 1: Kitchen (dishwasher, microwave, over)
+  + Submeter 2: Laundry (washing machine, dryer, refridgerator, light)
+  + Submeter 3: Electric water heater and air conditioner
+
+## Load libraries
+```{r, warning=FALSE, message=FALSE}
+library(RMySQL)
+library(lubridate)
+library(tidyverse)
+library(openxlsx)
+library(knitr)
+library(ggplot2)
+library(plotly)
+library(ggthemes)
+library(scales)
+library(imputeTS)
+library(ggfortify)
+library(forecast)
+library(dplyr)
+```
+
+## Load data
+```{r, warning=FALSE, message=FALSE}
+# establish SQL connection
+con = dbConnect(MySQL(), user = 'deepAnalytics',
+                password='Sqltask1234!', dbname='dataanalytics2018',
+                host = 'data-analytics-2018.cbrosir2cswx.us-east-1.rds.amazonaws.com')
+
+## list tables in database
+dbListTables(con)
+```
+```{r}
+## list attributes in 'yr_2006' table
+dbListFields(con, 'yr_2006')
+```
+```{r}
+## Select attributes needed for analysis
+yr_2006 <- dbGetQuery(con, 'SELECT Date, Time, Sub_metering_1, Sub_metering_2, Sub_metering_3 FROM yr_2006')
+yr_2007 <- dbGetQuery(con, 'SELECT Date, Time, Sub_metering_1, Sub_metering_2, Sub_metering_3 FROM yr_2007')
+yr_2008 <- dbGetQuery(con, 'SELECT Date, Time, Sub_metering_1, Sub_metering_2, Sub_metering_3 FROM yr_2008')
+yr_2009 <- dbGetQuery(con, 'SELECT Date, Time, Sub_metering_1, Sub_metering_2, Sub_metering_3 FROM yr_2009')
+yr_2010 <- dbGetQuery(con, 'SELECT Date, Time, Sub_metering_1, Sub_metering_2, Sub_metering_3 FROM yr_2010')
+```
+
+## Understand the data
+```{r, results='hide'}
+## check structure
+str(yr_2006)  
+str(yr_2007)  
+str(yr_2008)   
+str(yr_2009) 
+str(yr_2010)  
+
+## check head and tail
+head(yr_2006) 
+tail(yr_2006) # contains 2 weeks of data
+head(yr_2007) 
+tail(yr_2007) # contains 1 full year
+head(yr_2008) 
+tail(yr_2008) # contains 1 full year
+head(yr_2009) 
+tail(yr_2009) # contains 1 full year
+head(yr_2010) 
+tail(yr_2010) # contains 11 months
+```
+
+## Combine datasets
+```{r}
+## include only necessary years
+subMeters <- bind_rows(yr_2007, yr_2008, yr_2009)
+
+## check structure
+str(subMeters)
+```
+```{r}
+## check head and tail, ensuring dates are in correct order
+head(subMeters)
+tail(subMeters)
+```
+
+## Preprocessing
+```{r, message=FALSE}
+## combine Date and Time attributes into a new attribute column
+subMeters <- cbind(subMeters, paste(subMeters$Date, subMeters$Time), stringsAsFactors = FALSE)
+
+## change column name
+colnames(subMeters)[6] <- 'DateTime'
+
+## move DateTime closer to front of data frame
+subMeters <- subMeters %>% relocate(DateTime, .before = Sub_metering_1)
+
+## check structure
+str(subMeters)
+```
+
+#### So far so good...
+
+## Date and Time manipulation
+```{r, warning=FALSE, message=FALSE}
+## convert DateTime from character to POSIXct (number of seconds since January 1, 1970)
+subMeters$DateTime <- as.POSIXct(subMeters$DateTime, '%Y/%m/%d %H:%M:%S')
+
+## add time zone from France
+attr(subMeters$DateTime, 'tzone') <- 'Europe/Paris'
+
+## delete old Date and Time columns to create new ones columns with correct time zone
+subMeters$Date <- NULL
+subMeters$Time <- NULL
+
+## Create new Date column with correct time zone
+subMeters$Date <- date(subMeters$DateTime)
+subMeters$Time <- format(subMeters$DateTime, '%H:%M:%S')
+
+## check structure
+str(subMeters)
+```
+```{r}
+## move Date and Time to more strategic location
+subMeters <- subMeters %>% relocate(Date, .before = Sub_metering_1)
+subMeters <- subMeters %>% relocate(Time, .before = Sub_metering_1)
+
+## change name of certain columns
+subMeters <- subMeters %>% rename(sub1 = Sub_metering_1)
+subMeters <- subMeters %>% rename(sub2 = Sub_metering_2)
+subMeters <- subMeters %>% rename(sub3 = Sub_metering_3)
+
+## lubridate to create new attributes from 'DateTime' for analysis
+subMeters$year <- year(subMeters$DateTime)
+subMeters$quarter <- quarter(subMeters$DateTime)
+subMeters$month <- month(subMeters$DateTime)
+subMeters$week <- isoweek(subMeters$DateTime)
+subMeters$wday <- wday(subMeters$DateTime)
+subMeters$day <- day(subMeters$DateTime)
+subMeters$hour <- hour(subMeters$DateTime)
+subMeters$minute <- minute(subMeters$DateTime)
+
+## move Date and Time to more strategic location
+subMeters <- subMeters %>% relocate(sub1, .after = minute)
+subMeters <- subMeters %>% relocate(sub2, .after = sub1)
+subMeters <- subMeters %>% relocate(sub3, .after = sub2)
+
+## check structure
+str(subMeters)
+```
+#### All looks good
+
+## Check for missing data
+```{r}
+## group by date, obtain the count, and turn into data frame
+missing_datetime <- subMeters %>% count(Date)
+incomplete_data <- data.frame(table(missing_datetime$n))
+incomplete_data
+```
+
+```{r}
+## filter for all days that do not have 1440 hours
+missing_time <- missing_datetime %>% filter(n !=1440) 
+missing_time
+```
+
+### Observations: Out of 60 dates not at 1440 total minutes/day, 3 dates contain 1500 minutes (due to daylight savings time), and 57 dates have <1440 minutes/day. 25 days are missing 1 minute, and 15 days are missing 2-5 minutes. Due to insignificant number of missing minutes in 3 years, missing values were not deemed necessary tp impute for time series forecasting.
+
+## Initial EDA for 2007-2010 data
+```{r}
+### Viewing summary statistics
+sum(subMeters$sub1) # 1,819,989 total kilowatts used
+sum(subMeters$sub2) # 2,108,410 total kilowatts used
+sum(subMeters$sub3) # 9,758,843 total kilowatts used
+
+summary(subMeters)
+```
+### Summary of Energy Use by Submeter from 2007 to 2010: 
+
+* Sub-meter 1: Kitchen
+  + Least total energy used (1,819,989 Watts)
+  + Average 1.16 Watts per minute
+  + Largest energy range (0-82 Watts)
+* Sub-meter 2: Laundry
+  + Total energy used (2,108,410 Watts)
+  + Average 1.34 Watts per minute
+  + Energy range (0-78 Watts)
+* Sub-meter 3: Water Heater & AC
+  + Most total energy used (9,758,843 Watts)
+  + Average 6.21 Watts per minute
+  + Smallest energy range (0-32 Watts)
+
+
+
+## Forecasting and Visualizing
+
+#### Energy use by submeter will be forecasted as follows:
+* Submeter 1 Kitchen: Collected once per day (365 observations/year) at 6:00pm from 2007 through 2009
+* Submeter 2 Laundry: Collected once per day (365 observations/year) at 7:00pm from 2007 through 2009 
+* Submeter 3 Water Heater & AC: Collected once per week (52 observations/year) on Mondays at 8:00pm from 2007 through 2009
+
+#### Submeter 1: Kitchen
+#### Subset to one observation per day at 6:00pm for 2007, 2008, 2009
+```{r}
+house070809Daily <- filter(subMeters, hour==18 & minute==0)
+houseSub1Monthly <- filter(subMeters, week==1)
+```
+
+#### Create time series object for Submeter 1
+```{r}
+tsSM1_070809Daily <- ts(house070809Daily$sub1, frequency = 365, start = c(2007,1))
+tsSM1_070809Daily
+```
+```{r}
+# plot daily time series for submeter 1
+autoplot(tsSM1_070809Daily, ts.colour = 'black', xlab = 'Time', ylab = 'Watt Hours', main = 'Submeter 1:  Kitchen, Daily Interval', size=.7) +
+  theme_bw()
+```
+
+#### Fit to time series linear regression 
+```{r, message=FALSE, warning=FALSE}
+library(tseries)
+
+fitSM1 <- tslm(tsSM1_070809Daily ~ trend + season)
+summary(fitSM1)
+```
+
+#### Observations
+R2 = 0.3132 and RMSE = 6.556
+There is quite low R2 (accuracy), which isn't uncommon in time series forecasting, especially if predictions are based off of longer, highly seasonal time frames. RMSE is the error rate, which decent. We will plot next to visualize. 
+
+
+```{r}
+# create forecast for 25 days into 2010
+forecastfitSM1 <- forecast(fitSM1, h=25)
+plot(forecastfitSM1, xlim = c(2009.7, 2010.07), ylim = c(0, 40), xlab = 'Weeks', ylab = 'Watts', main = 'Submeter 1: 25 Day Forecast from LM Model') 
+```
+
+```{r}
+## closer view of 25 day forecast into 2010
+forecastfitSM1 <- forecast(fitSM1, h=25)
+plot(forecastfitSM1, xlim = c(2009.98, 2010.06), ylim = c(0, 30), xlab = 'Weeks', ylab = 'Watts', main = 'Submeter 1: 25-Day Forecast from LM Model') 
+```
+
+#### Observations
+Forecast for energy use with submeter 1 Kitchen is on average quite low for 25 days, with one spike about midway. The 75 and 90% confidence shadings showcase the variation in predictions. This variation is likely due to the long time frame from which predictions were based (2007 to 2010), which included much seasonality. 
+
+
+#### Decompose time series into trend, seasonal, random, then plot and summarize
+```{r}
+components070809SM1daily <- decompose(tsSM1_070809Daily)
+# decomposition visualization with analysis
+plot(components070809SM1daily)
+summary(components070809SM1daily)  
+```
+
+#### Trend reveals steady decline from 1.1 in mid-2007 to low 0.6 mid-2008 then rise to 1.8 mid-2009
+#### Seasonality is hard to view
+
+## Holt Winters Forecasting - Exponential Smoothing
+```{r}
+# first subtract the seasonal component removed in prior step
+tsSM1_070809Adjusted <- tsSM1_070809Daily - components070809SM1daily$seasonal
+autoplot(tsSM1_070809Adjusted)
+```
+ 
+```{r}
+# test seasonal adjustment by running Decompose again, note the extremely small scale in seasonal line
+plot(decompose(tsSM1_070809Adjusted))
+```
+
+
+```{r}
+# holt winters exponential smoothing
+tsSM1_HW <- HoltWinters(tsSM1_070809Daily)
+plot(tsSM1_HW, ylim = c(0, 40))
+```
+
+
+```{r}
+# holt winters 25-day forecast
+tsSM1_HWforecast <- forecast(tsSM1_HW, h=25)
+plot(tsSM1_HWforecast, ylim = c(0, 40), xlim = c(2009.7,2010.06), ylab = 'Watts', xlab = 'Time', main = 'Submeter 1 Kitchen: Holt-Winters 25 Day Forecast')
+```
+
+
+```{r}
+# forecast holt winters with diminished confidence levels
+tsSM1_HWforecast_C <- forecast(tsSM1_HW, h=25, level = c(10,25))
+plot(tsSM1_HWforecast_C, ylim = c(0, 30), ylab = 'Watts', xlab = 'Time', main = 'Submeter 1 Kitchen: Holt-Winters 25 Day Forecast, 25-50% CI', start(2010))
+```
+
+#### Observations
+* Submeter 1 25-day forecast with seasonality removed projected at about 2 Watts on average each day with a large spike at about day 13
+
+```{r}
+# change wday and month from numbers to labels for next forecast
+subMeters$wday <- wday(subMeters$DateTime, label=TRUE)
+subMeters$month <- month(subMeters$DateTime, label=FALSE)
+subMeters$day <- wday(subMeters$DateTime, label=TRUE)
+```
+
+## Submeter 3: Water Heater & AC
+```{r}
+# subset to one observation per week on Mondays at 8:00pm for 2007, 2008, 2009
+house070809weekly <- filter(subMeters, wday=='Mon' & hour==20 & minute==0)
+```
+
+```{r}
+# create time series object for submeter 3
+tsSM3_070809weekly <- ts(house070809weekly$sub3, frequency = 52, start = c(2007,1))
+tsSM3_070809weekly
+```
+
+```{r}
+# time Series Visualization Submeter 3
+autoplot(tsSM3_070809weekly, ts.colour = 'black', xlab = 'Time', ylab = 'Watt Hours', main = 'Submeter 3:  Water Heater & AC, Weekly Interval', size = .7) +
+           theme_bw()
+```
+
+```{r}
+# create time series linear regression
+fitSM3 <- tslm(tsSM3_070809weekly ~ trend + season)
+summary(fitSM3) #R2 and RMSE
+```
+
+```{r}
+# create forecast, then plot
+forecastfitSM3 <- forecast(fitSM3, h=10)
+plot(forecastfitSM3) 
+```
+
+#### Forecast time series linear regression with confidence levels 80 and 90%
+```{r}
+forecastfitSM3c <- forecast(fitSM3, h=10, level=c(25,50))
+forecastfitSM3
+# Linear Regression Forecast Visualization
+plot(forecastfitSM3c, ylim = c(0, 20), xlim = c(2009.5,2010.2), ylab = 'Watt-Hours', xlab = 'Time', main = 'Submeter 3: Water Heater & AC 10-Week Seasonal Forecast')
+```
+
+#### Decompose time series linear regression
+```{r}
+# remove seasonal component to analyze trend independently
+components070809SM3weekly <- decompose(tsSM3_070809weekly)
+plot(components070809SM3weekly)
+summary(components070809SM3weekly)
+```
+
+#### Trend reveals power use steady decline from high of 6 mid-2007 to low of 2 late-2008, then picked back up
+#### Seasonal effects shows decreased use Q3 and peak use Q1 and Q2
+```{r}
+components070809SM3weekly$seasonal 
+components070809SM3weekly$trend
+components070809SM3weekly$random
+```
+
+## Holt Winters Forecasting Submeter 3 - Exponential Smoothing
+```{r}
+# first subtract the seasonal component removed in prior step
+tsSM3_070809Adjusted <- tsSM3_070809weekly - components070809SM3weekly$seasonal
+autoplot(tsSM3_070809Adjusted)
+```
+
+
+```{r}
+# test seasonal adjustment by running decompose again, note extremely small scale in seasonal line
+plot(decompose(tsSM3_070809Adjusted))
+```
+
+## Holt Winters Exponential Smoothing Submeter 3
+```{r}
+tsSM3_HW <- HoltWinters(tsSM3_070809weekly)
+tsSM3_HW
+plot(tsSM3_HW, ylim = c(0, 25))
+```
+
+
+```{r}
+# holt winters forecast submeter 3
+tsSM3_HWforecast <- forecast(tsSM3_HW, h=10)
+plot(tsSM3_HWforecast, ylim = c(0, 30), xlim = c(2009.7,2010.2), ylab = 'Watts', xlab = 'Time', main = 'Water Heater/AC: Holt-Winters 10-Week Forecast')
+```
+
+
+```{r}
+# forecast Holt Winters with diminished confidence levels
+tsSM3_HWforecast_C <- forecast(tsSM3_HW, h=10, level = c(25, 50))
+plot(tsSM3_HWforecast_C, ylim = c(0, 30), ylab = 'Watts', xlab = 'Time', main = 'Water Heater/AC: Holt-Winters 10-Week Forecast, 25-50% CI', start(2010))
+```
+
+#### Observation
+* Submeter 3 ten week regression forecast with seasonality removed projected at about 6 Watts typical with rise and peak about 7 weeks into 2010
+
+
+## Submeter 2: Laundry
+## Subset to one observation per day at 7:00pm for 2007, 2008, 2009
+```{r}
+house070809daily <- filter(subMeters, hour==19 & minute==0)
+houseDec2009daily <- filter(subMeters, year==2009 & month==12 & minute==0)
+# create time series object for submeter 2
+tsSM2_070809daily <- ts(house070809daily$sub2, frequency = 31)
+# time series visualization submeter 2
+autoplot(tsSM2_070809daily, ts.colour = 'black', xlab = 'Time', ylab = 'Watt Hours', main = 'Submeter 2:  Laundry, Daily Interval') +
+  theme_bw()
+```
+
+```{r}
+# fit to time series linear regression, then summary to obtain R2 and RMSE
+fitSM2 <- tslm(tsSM2_070809daily ~ trend + season)
+summary(fitSM2)
+```
+
+
+```{r}
+# create forecast
+forecastfitSM2 <- forecast(fitSM2, h=25)
+forecastfitSM2
+plot(forecastfitSM2, xlim = c(35.5, 37), ylim = c(0, 40)) 
+```
+
+
+
+```{r}
+# decompose time series into trend, seasonal, random, then plot
+components070809SM2daily <- decompose(tsSM2_070809daily)
+plot(components070809SM2daily)
+summary(components070809SM2daily)  
+```
+
+#### Trend reveals power use decline with high of 2.4 2008 Q2 to low of 1.6 in 2009 Q2, then rises to 2.1 mid-2009
+
+## Holt Winters Forecasting Submeter 2 - Exponential Smoothing
+```{r}
+# first subtract the seasonal component removed in prior step
+tsSM2_070809Adjusted <- tsSM2_070809daily - components070809SM2daily$seasonal
+autoplot(tsSM2_070809Adjusted)
+```
+```{r}
+# test seasonal adjustment by running decompose again, note extremely small scale in seasonal line
+plot(decompose(tsSM2_070809Adjusted))
+```
+
+## Holt Winters Exponential Smoothing Submeter 2
+```{r}
+tsSM2_HW <- HoltWinters(tsSM2_070809daily)
+tsSM2_HW
+plot(tsSM2_HW, ylim = c(0, 20))
+```
+
+
+```{r}
+# holt winters forecast
+tsSM2_HWforecast <- forecast(tsSM2_HW, h=25)
+tsSM2_HWforecast
+```
+
+```{r}
+plot(tsSM2_HWforecast, ylim = c(0, 20), xlim = c(34, 38), ylab = 'Watts', xlab = 'Time', main = 'Submeter 2 Laundry: Holt-Winters 25-Day Forecast')
+```
+
+#### Observations
+* Submeter 2 regression line for 25 day Holt-Winters forecast ranges from 3 to 13 daily Watts
+
+
+## Comparison of all seasonal decomposition model results
+```{r}
+decomposition_summary_seasonal <- data.frame(rbind(summary(components070809SM1daily$seasonal), summary(components070809SM2daily$seasonal), summary(components070809SM3weekly$seasonal)))
+
+decomposition_summary_seasonal['Timeseries'] <- data.frame(rbind('Daily Sub1 TS Seasonal', 'Daily Sub2 TS seasonal', 'Weekly Sub3 TS Seasonal'))
+
+kable(decomposition_summary_seasonal, format = 'html', caption = 'Results of All Seasonal Decomposition Models', digits=3) %>% kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+```
+
+#### Observation: Seasonal median and means are all negative
+
+## Comparison of all trend decomposition model results
+```{r}
+decomposition_summary_trend <- data.frame(rbind(summary(components070809SM1daily$trend), summary(components070809SM2daily$trend),summary(components070809SM3weekly$trend)))
+
+decomposition_summary_trend['Timeseries'] <- data.frame(rbind('Daily Sub1 TS Trend', 'Daily Sub2 TS Trend', 'Weekly Sub3 TS Trend'))
+
+kable(decomposition_summary_trend, format = 'html', caption = 'Results of All Trend Decomposition Models', digits=3) %>% kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+```
+
+#### Observation: Daily and weekly trends all positive
+
+
+## Comparison of all random decomposition model results
+```{r}
+decomposition_summary_random <- data.frame(rbind(summary(components070809SM1daily$random), summary(components070809SM2daily$random),summary(components070809SM3weekly$random)))
+
+decomposition_summary_random['Timeseries'] <- data.frame(rbind('Daily Sub1 TS Random', 'Daily Sub2 TS Random', 'Weekly Sub3 TS Random'))
+
+kable(decomposition_summary_random, format = 'html', caption = 'Results of All Random Decomposition Models', digits=3) %>% kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+```
+
+## Comparison of all Linear Regression mean forecasted results
+```{r}
+lm_summary <- data.frame(rbind(summary(forecastfitSM1$mean), summary(forecastfitSM2$mean), summary(forecastfitSM3$mean)))
+
+lm_summary['Timeseries'] <- data.frame(rbind('Sub1 Linear Time Series 25-Day Forecast', 'Sub2 Linear Time Series 25-Day Forecast', 'Sub3 Linear Time Series 10-Week Forecast'))
+
+kable(lm_summary, format = 'html', caption = 'Results of All Linear Regression Forecasted Models', digits=3) %>% kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+```
+
+## Comparison of all Holt Winters mean forecasted results
+```{r}
+hw_summary <- data.frame(rbind(summary(tsSM1_HWforecast$mean), summary(tsSM2_HWforecast$mean), summary(tsSM3_HWforecast$mean)))
+
+hw_summary['Timeseries'] <- data.frame(rbind('Sub1 Holt Winters 25-Day Forecast', 'Sub2 Holt Winters 25-Day Forecast', 'Sub3 Holt Winters 10-Week Forecast'))
+
+kable(hw_summary, format = 'html', caption = 'Results of All Holt Winters Forecasted Models', digits=3) %>% kable_styling(bootstrap_options = 'striped', full_width = FALSE)
+```
+
+
+#### Observations
+* Holt Winters forecasted results will be used for energy use predictions
+  + Submeter 1 (Kitchen): mean of 2.107 Watt/hour energy use forecasted for 25 days
+  + Submeter 2 (Laundry): mean of 5.172 Watts/hour energy use forecasted for 25 days
+  + Submeter 3 (Water heater & AC): mean of 7.866 Watts/hour for 10 week forecast
+  + Predicted average energy use in watts/hour for each submeter is projected to be higher than average energy used from 2007-2010 (Sub1 1.16 Watts/hour, Sub2 1.34 Watts/hour, Sub3 6.21 Watts/hour). Energy saving recommendations going in to 2010 are provided to help reduce energy and save money.
+
+#### Energy Saving Recommendations
+* Reset HVAC controls to reduce daily Water Heater & AC spikes noted throughout the year to save energy
+* Reduce the length of time AC and/or Water Heater is programmed to turn on during the day
+* Reset AC thermometer in winter months to higher temperature setting to reduce energy use during peak season
+* Regularly replace AC filters, turn off lights whenever you leave a room, and reduce amount of hot water used when possible
+
